@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-sidecar
+  labels:
+    app: qwen-sidecar
+spec:
+  selector:
+    app: qwen-sidecar
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: metrics
+      port: 9090
+      targetPort: 9090

@@ -1,0 +1,43 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: qwen-sidecar-alerts
+spec:
+  groups:
+    - name: qwen-inference
+      interval: 30s
+      rules:
+        - alert: ModelNotHealthy
+          expr: ml_model_healthy{model_name="qwen"} == 0
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Qwen model server is not healthy"
+
+        - alert: KVCacheNearFull
+          expr: ml_gpu_kv_cache_usage{model_name="qwen"} > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "KV cache usage > 90%"
+
+        - alert: RequestQueueBacklog
+          expr: ml_requests_waiting{model_name="qwen"} > 10
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} requests queued"
+
+        - alert: ModelLoaderCrashLoop
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              container="model-loader"
+            }[1h]) > 3
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Model loader crash-looping"

@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-sidecar
+  labels:
+    app: qwen-sidecar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-sidecar
+  template:
+    metadata:
+      labels:
+        app: qwen-sidecar
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      # ── Model Loader: Native Sidecar (K8s 1.28+) ────────────────
+      initContainers:
+        - name: model-loader
+          restartPolicy: Always
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install -q huggingface_hub && \
+              python /scripts/loader.py
+          env:
+            - name: HF_TOKEN
+              value: "${HF_TOKEN}"
+            - name: MODEL_ID
+              value: "Qwen/Qwen2.5-1.5B-Instruct"
+            - name: MODEL_DIR
+              value: "/models/qwen"
+            - name: READY_FILE
+              value: "/models/.ready"
+            - name: POLL_INTERVAL
+              value: "300"
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+            - name: loader-scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "1"
+              memory: 4Gi
+
+      containers:
+        # ── Primary: vLLM Inference Server ─────────────────────────
+        # GPU mode:  use image as-is, keep nvidia.com/gpu in resources
+        # CPU mode:  set VLLM_DEVICE=cpu env var, remove nvidia.com/gpu lines
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for model-loader to finish..."
+              while [ ! -f /models/.ready ]; do sleep 2; done
+              echo "Model ready, starting vLLM"
+              exec vllm serve /models/qwen \
+                --served-model-name qwen \
+                --port 8000 \
+                --max-model-len 2048 \
+                --host 0.0.0.0 \
+                --dtype float32
+          env:
+            - name: VLLM_TARGET_DEVICE
+              value: "cuda"          # Change to "cuda" for GPU nodes
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "test -f /models/.ready && curl -sf http://localhost:8000/health"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 12    # CPU startup is slow — give it 3 minutes
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 15
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "touch /models/.shutdown && sleep 10"]
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "2"
+              memory: 6Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+            # ── Uncomment below for GPU nodes ──
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+
+        # ── Metrics Exporter Sidecar ──────────────────────────────
+        - name: metrics-exporter
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install -q prometheus_client requests && \
+              python /scripts/exporter.py
+          env:
+            - name: VLLM_URL
+              value: "http://localhost:8000"
+            - name: MODEL_NAME
+              value: "qwen"
+            - name: METRICS_PORT
+              value: "9090"
+          ports:
+            - name: metrics
+              containerPort: 9090
+          volumeMounts:
+            - name: exporter-scripts
+              mountPath: /scripts
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "while ! test -f /models/.shutdown; do sleep 1; done; sleep 15"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+      volumes:
+        - name: model-volume
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: loader-scripts
+          configMap:
+            name: model-loader-script
+        - name: exporter-scripts
+          configMap:
+            name: metrics-exporter-script
